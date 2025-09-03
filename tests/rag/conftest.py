@@ -8,6 +8,9 @@ from kubernetes.dynamic import DynamicClient
 from llama_stack_client import LlamaStackClient, APIConnectionError
 from ocp_resources.data_science_cluster import DataScienceCluster
 from ocp_resources.deployment import Deployment
+from ocp_resources.service import Service
+from ocp_resources.config_map import ConfigMap
+from .utils import get_etcd_deployment_template, get_milvus_deployment_template
 from ocp_resources.namespace import Namespace
 from ocp_resources.project_project_openshift_io import Project
 from simple_logger.logger import get_logger
@@ -40,11 +43,15 @@ def llama_stack_server() -> Dict[str, Any]:
                 {"name": "VLLM_API_TOKEN", "value": rag_vllm_token},
                 {"name": "VLLM_URL", "value": rag_vllm_url},
                 {"name": "FMS_ORCHESTRATOR_URL", "value": "http://localhost"},
+                {"name": "MILVUS_DB_PATH", "value": "~/.llama/distributions/rh/milvus.db"},
+                {"name": "MILVUS_ENDPOINT", "value": "http://rag-milvus-service:19530"},
+                {"name": "MILVUS_TOKEN", "value": "root:Milvus"},
             ],
             "name": "llama-stack",
             "port": 8321,
         },
-        "distribution": {"name": "rh-dev"},
+        "distribution": {"image": "quay.io/opendatahub/llama-stack:odh"},
+        "userConfig": {"configMapName": "rag-llama-stack-config-map"},
     }
 
 
@@ -67,6 +74,237 @@ def rag_test_namespace(
     namespace_name = generate_random_name(prefix="rag-test")
     with create_ns(name=namespace_name, admin_client=admin_client, unprivileged_client=unprivileged_client) as ns:
         yield ns
+
+
+@pytest.fixture(scope="class")
+def etcd_deployment(
+    rag_test_namespace: Namespace | Project,
+    admin_client: DynamicClient,
+) -> Generator[Deployment, Any, Any]:
+    with Deployment(
+        client=admin_client,
+        namespace=rag_test_namespace.name,
+        name="rag-etcd-deployment",
+        replicas=1,
+        selector={"matchLabels": {"app": "etcd"}},
+        strategy={"type": "Recreate"},
+        template=get_etcd_deployment_template(),
+        teardown=True,
+    ) as deployment:
+        deployment.wait_for_replicas(deployed=True, timeout=Timeout.TIMEOUT_2MIN)
+        yield deployment
+
+
+@pytest.fixture(scope="class")
+def etcd_service(admin_client: DynamicClient, rag_test_namespace: Namespace | Project) -> Generator[Service, Any, Any]:
+    with Service(
+        client=admin_client,
+        namespace=rag_test_namespace.name,
+        name="rag-etcd-service",
+        ports=[
+            {
+                "port": 2379,
+                "targetPort": 2379,
+            }
+        ],
+        selector={"app": "etcd"},
+    ) as service:
+        yield service
+
+
+@pytest.fixture(scope="class")
+def remote_milvus_deployment(
+    rag_test_namespace: Namespace | Project,
+    admin_client: DynamicClient,
+    etcd_deployment: Deployment,
+    etcd_service: Service,
+) -> Generator[Deployment, Any, Any]:
+    with Deployment(
+        client=admin_client,
+        namespace=rag_test_namespace.name,
+        name="rag-milvus-deployment",
+        replicas=1,
+        selector={"matchLabels": {"app": "milvus-standalone"}},
+        strategy={"type": "Recreate"},
+        template=get_milvus_deployment_template(),
+        teardown=True,
+    ) as deployment:
+        deployment.wait_for_replicas(deployed=True, timeout=Timeout.TIMEOUT_2MIN)
+        yield deployment
+
+
+@pytest.fixture(scope="class")
+def milvus_service(
+    admin_client: DynamicClient, rag_test_namespace: Namespace | Project
+) -> Generator[Service, Any, Any]:
+    with Service(
+        client=admin_client,
+        namespace=rag_test_namespace.name,
+        name="rag-milvus-service",
+        ports=[
+            {
+                "name": "grpc",
+                "port": 19530,
+                "targetPort": 19530,
+            },
+        ],
+        selector={"app": "milvus-standalone"},
+    ) as service:
+        yield service
+
+
+@pytest.fixture(scope="class")
+def llama_stack_config_map(
+    rag_test_namespace: Namespace | Project,
+    admin_client: DynamicClient,
+) -> Generator[ConfigMap, Any, Any]:
+    with ConfigMap(
+        client=admin_client,
+        namespace=rag_test_namespace.name,
+        name="rag-llama-stack-config-map",
+        data={
+            "run.yaml": """# Llama Stack Configuration
+version: "2"
+image_name: rh
+apis:
+  - agents
+  - datasetio
+  - eval
+  - inference
+  - safety
+  - scoring
+  - telemetry
+  - tool_runtime
+  - vector_io
+providers:
+  inference:
+    - provider_id: vllm-inference
+      provider_type: remote::vllm
+      config:
+        url: ${env.VLLM_URL:=http://localhost:8000/v1}
+        max_tokens: ${env.VLLM_MAX_TOKENS:=4096}
+        api_token: ${env.VLLM_API_TOKEN:=fake}
+        tls_verify: ${env.VLLM_TLS_VERIFY:=true}
+    - provider_id: sentence-transformers
+      provider_type: inline::sentence-transformers
+      config: {}
+  vector_io:
+    - provider_id: remote-milvus
+      provider_type: remote::milvus
+      config:
+        uri: ${env.MILVUS_ENDPOINT:=http://localhost:19530}
+        token: ${env.MILVUS_TOKEN:=root:Milvus}
+        kvstore:
+          type: sqlite
+          db_path: ~/.llama/distributions/rh/milvus_remote_registry.db
+  safety:
+    - provider_id: trustyai_fms
+      provider_type: remote::trustyai_fms
+      config:
+        orchestrator_url: ${env.FMS_ORCHESTRATOR_URL:=}
+        ssl_cert_path: ${env.FMS_SSL_CERT_PATH:=}
+        shields: {}
+  agents:
+    - provider_id: meta-reference
+      provider_type: inline::meta-reference
+      config:
+        persistence_store:
+          type: sqlite
+          namespace: null
+          db_path: /opt/app-root/src/.llama/distributions/rh/agents_store.db
+        responses_store:
+          type: sqlite
+          db_path: /opt/app-root/src/.llama/distributions/rh/responses_store.db
+  eval:
+    - provider_id: trustyai_lmeval
+      provider_type: remote::trustyai_lmeval
+      config:
+        use_k8s: True
+        base_url: ${env.VLLM_URL:=http://localhost:8000/v1}
+  datasetio:
+    - provider_id: huggingface
+      provider_type: remote::huggingface
+      config:
+        kvstore:
+          type: sqlite
+          namespace: null
+          db_path: /opt/app-root/src/.llama/distributions/rh/huggingface_datasetio.db
+    - provider_id: localfs
+      provider_type: inline::localfs
+      config:
+        kvstore:
+          type: sqlite
+          namespace: null
+          db_path: /opt/app-root/src/.llama/distributions/rh/localfs_datasetio.db
+  scoring:
+    - provider_id: basic
+      provider_type: inline::basic
+      config: {}
+    - provider_id: llm-as-judge
+      provider_type: inline::llm-as-judge
+      config: {}
+    - provider_id: braintrust
+      provider_type: inline::braintrust
+      config:
+        openai_api_key: ${env.OPENAI_API_KEY:=}
+  telemetry:
+    - provider_id: meta-reference
+      provider_type: inline::meta-reference
+      config:
+        service_name: "${env.OTEL_SERVICE_NAME:=}"
+        sinks: console,sqlite
+        sqlite_db_path: /opt/app-root/src/.llama/distributions/rh/trace_store.db
+        otel_exporter_otlp_endpoint: ${env.OTEL_EXPORTER_OTLP_ENDPOINT:=}
+  tool_runtime:
+    - provider_id: brave-search
+      provider_type: remote::brave-search
+      config:
+        api_key: ${env.BRAVE_SEARCH_API_KEY:=}
+        max_results: 3
+    - provider_id: tavily-search
+      provider_type: remote::tavily-search
+      config:
+        api_key: ${env.TAVILY_SEARCH_API_KEY:=}
+        max_results: 3
+    - provider_id: rag-runtime
+      provider_type: inline::rag-runtime
+      config: {}
+    - provider_id: model-context-protocol
+      provider_type: remote::model-context-protocol
+      config: {}
+metadata_store:
+  type: sqlite
+  db_path: /opt/app-root/src/.llama/distributions/rh/registry.db
+inference_store:
+  type: sqlite
+  db_path: /opt/app-root/src/.llama/distributions/rh/inference_store.db
+models:
+  - metadata: {}
+    model_id: ${env.INFERENCE_MODEL}
+    provider_id: vllm-inference
+    model_type: llm
+  - metadata:
+      embedding_dimension: 768
+    model_id: granite-embedding-125m
+    provider_id: sentence-transformers
+    provider_model_id: ibm-granite/granite-embedding-125m-english
+    model_type: embedding
+shields: []
+vector_dbs: []
+datasets: []
+scoring_fns: []
+benchmarks: []
+tool_groups:
+  - toolgroup_id: builtin::websearch
+    provider_id: tavily-search
+  - toolgroup_id: builtin::rag
+    provider_id: rag-runtime
+server:
+  port: 8321
+  external_providers_dir: /opt/app-root/.llama/providers.d"""
+        },
+    ) as config_map:
+        yield config_map
 
 
 @pytest.fixture(scope="class")
